@@ -8,15 +8,40 @@ from requests.adapters import HTTPAdapter
 from slack import WebClient
 from slack.errors import SlackApiError
 import azure.functions as func
+from azure.appconfiguration import AzureAppConfigurationClient, ConfigurationSetting
+from azure.core.exceptions import ResourceNotFoundError
+from enum import Enum
+
+app_config_connection_string = os.getenv('AZURE_APP_CONFIG_CONNECTION_STRING')
 
 slack_token = os.getenv("SLACK_TOKEN")
 slack_channel_id = os.getenv("SLACK_CHANNEL_ID")
 client = WebClient(token=slack_token)
 
-targets = ['https://www.seeed.co.jp/']
-in_errors = {}
-
 #logging.basicConfig(level=logging.DEBUG)
+
+class Targets(Enum):
+    SeeedKK = ('https://www.seeed.co.jp/', 'UrlMonitor:Web.SeeedKK:Status')
+    #Google = ('https://www.google.co.jp/', 'UrlMonitor:Web.Google:Status')
+
+    def __init__(self, url, key):
+        self.url = url
+        self.key = key
+
+def update_status_on_appconf(target, value):
+    logging.info('  ==> statusUpdate: ' + value + ' (' + target.key + ')')
+    app_config_client = AzureAppConfigurationClient.from_connection_string(app_config_connection_string)
+    config_setting = ConfigurationSetting(key=target.key, value=value)
+    target_status = app_config_client.set_configuration_setting(config_setting)
+    return target_status
+
+def previous_status_on_appconf(target):
+    app_config_client = AzureAppConfigurationClient.from_connection_string(app_config_connection_string)
+    try:
+        target_status = app_config_client.get_configuration_setting(key=target.key)
+    except ResourceNotFoundError:
+        target_status = update_status_on_appconf(target, 'Unknown')
+    return target_status
 
 def send_notification(message):
     logging.info('  ==> postMessage: ' + message)
@@ -44,10 +69,10 @@ def main(mytimer: func.TimerRequest) -> None:
     session.mount("http://", HTTPAdapter(max_retries=retries))
     session.mount("https://", HTTPAdapter(max_retries=retries))
 
-    for url in targets:
+    for target in Targets:
         error_message = ''
         try:
-            status_code = requests.get(url, timeout=(10.0, 30.0)).status_code
+            status_code = requests.get(target.url, timeout=(10.0, 30.0)).status_code
         except requests.exceptions.ReadTimeout:
             error_message = 'Timeout'
         except requests.exceptions.ConnectionError:
@@ -58,16 +83,16 @@ def main(mytimer: func.TimerRequest) -> None:
             else:
                 error_message = "Status Code " + str(status_code)
 
-        in_error = in_errors.get(url, False)
+        status = previous_status_on_appconf(target)
         if not error_message:
-            logging.info('[ OK]: %s', url)
-            if in_error == True:
-                in_errors[url] = False
-                message = '- ' + url + ' is running normally.'
+            logging.info('[ OK]: %s', target.url)
+            if not 'Running' in status.value:
+                update_status_on_appconf(target, 'Running')
+                message = '- ' + target.url + ' is running normally.'
                 send_notification(message)
         else:
-            logging.info('[ERR]: %s (%s)', url, error_message)
-            if in_error == False:
-                in_errors[url] = True
-                message = '- An error has been detected on ' + url + '.'
+            logging.info('[ERR]: %s (%s)', target.url, error_message)
+            if 'Running' in status.value:
+                update_status_on_appconf(target, 'Stopping')
+                message = '- An error has been detected on ' + target.url + '.'
                 send_notification(message)

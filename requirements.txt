@@ -1,3 +1,4 @@
+azure-appconfiguration
 azure-functions
 slackclient
 requests_oauthlib
